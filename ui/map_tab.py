@@ -1744,6 +1744,22 @@ class MapCanvas(QWidget):
         if not subtract_shapes:
             return target_shape.area
 
+        try:
+            subtraction_union = unary_union(subtract_shapes)
+            effective_shape = target_shape.difference(subtraction_union)
+        except Exception:
+            return target_shape.area
+
+        if effective_shape.is_empty:
+            return 0.0
+
+        if not effective_shape.is_valid:
+            effective_shape = effective_shape.buffer(0)
+            if effective_shape.is_empty:
+                return 0.0
+
+        return max(0.0, float(effective_shape.area))
+
     def _calc_total_effective_area(self) -> float:
         return sum(self._effective_polygon_area(poly) for poly in self.map_polygons)
 
