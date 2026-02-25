@@ -3776,6 +3776,20 @@ class MapTab(QWidget):
         self._sync_label_filter_menu()
         self._refresh_obj_list()
 
+    def _on_show_dynamic_points_toggled(self, checked: bool):
+        self.canvas.show_dynamic_points = checked
+        if hasattr(self, "chk_auto_dynamic_points"):
+            self.chk_auto_dynamic_points.setEnabled(checked)
+        self.canvas._sync_dynamic_points()
+        self.canvas.update()
+        self._refresh_obj_list()
+
+    def _on_auto_dynamic_points_toggled(self, checked: bool):
+        self.canvas.auto_dynamic_points = checked
+        self.canvas._sync_dynamic_points()
+        self.canvas.update()
+        self._refresh_obj_list()
+
     def _create_polygon_from_selected(self):
         self.canvas.create_polygon_from_selected()
         self._update_geo_labels()
