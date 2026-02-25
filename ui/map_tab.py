@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QCheckBox, QGroupBox, QRadioButton, QButtonGroup,
     QApplication, QSizePolicy, QLineEdit,
-    QMenu, QColorDialog, QFileDialog, QComboBox,
+    QMenu, QColorDialog, QFileDialog, QComboBox, QToolButton,
     QTreeWidget, QTreeWidgetItem, QSplitter, QFrame,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF, QRectF, QTimer
@@ -32,6 +32,13 @@ from PyQt6.QtGui import (
 )
 
 from core.config import Config
+
+try:
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+except ImportError:  # pragma: no cover - fallback для окружений без shapely
+    ShapelyPolygon = None
+    unary_union = None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -369,6 +376,10 @@ class MapCanvas(QWidget):
         self.point_mode:   bool             = False
         self.auto_polygon: bool             = True   # авто-замыкание полигонов
         self.show_geo_labels: bool          = True   # метки расстояний/углов на рёбрах
+        self.show_coord_labels: bool        = True
+        self.show_angle_labels: bool        = True
+        self.show_area_labels: bool         = True
+        self.show_edge_length_labels: bool  = True
         self.area_unit:    str              = "m2"   # "m2" | "ha"
 
         # Выделение (multi-select)
@@ -421,6 +432,8 @@ class MapCanvas(QWidget):
 
         # Динамические точки пересечений рёбер
         self.dynamic_points: List[DynamicPoint] = []
+        self.show_dynamic_points: bool = True
+        self.auto_dynamic_points: bool = True
 
         # R-поворот мышью
         self._rotate_mode:          bool                       = False
@@ -685,12 +698,19 @@ class MapCanvas(QWidget):
             if mx_e < -60 or mx_e > W + 60 or my_e < -60 or my_e > H + 60:
                 continue
 
-            dist = haversine_distance(pt_a.lat, pt_a.lon, pt_b.lat, pt_b.lon)
-            dist_str = (f"{dist/1000:.3f} км" if dist >= 1000 else
-                        f"{dist:.2f} м"       if dist >= 1   else
-                        f"{dist*100:.1f} см")
-            bearing = self._calc_bearing(pt_a.lat, pt_a.lon, pt_b.lat, pt_b.lon)
-            lbl = f"{dist_str}  ∠{bearing:.1f}°"
+            parts = []
+            if self.show_edge_length_labels:
+                dist = haversine_distance(pt_a.lat, pt_a.lon, pt_b.lat, pt_b.lon)
+                dist_str = (f"{dist/1000:.3f} км" if dist >= 1000 else
+                            f"{dist:.2f} м"       if dist >= 1   else
+                            f"{dist*100:.1f} см")
+                parts.append(dist_str)
+            if self.show_angle_labels:
+                bearing = self._calc_bearing(pt_a.lat, pt_a.lon, pt_b.lat, pt_b.lon)
+                parts.append(f"∠{bearing:.1f}°")
+            if not parts:
+                continue
+            lbl = "  ".join(parts)
 
             f   = font_hov if is_hov else font
             fm  = fm_h     if is_hov else fm_n
@@ -742,8 +762,9 @@ class MapCanvas(QWidget):
             lines: List[Tuple[str, bool]] = []   # (text, is_header)
             if pt.label:
                 lines.append((pt.label, True))
-            lines.append((f"{pt.lat:+.6f}° N", False))
-            lines.append((f"{pt.lon:+.6f}° E", False))
+            if self.show_coord_labels:
+                lines.append((f"{pt.lat:+.6f}° N", False))
+                lines.append((f"{pt.lon:+.6f}° E", False))
 
             # Дирекционный угол к первому смежному ребру
             for e in self.map_edges:
@@ -754,10 +775,13 @@ class MapCanvas(QWidget):
                     other_id = e.point_a_id
                 if other_id:
                     other = self._get_point_by_id(other_id)
-                    if other:
+                    if other and self.show_angle_labels:
                         bear = self._calc_bearing(pt.lat, pt.lon, other.lat, other.lon)
                         lines.append((f"∠ {bear:.1f}°", False))
                     break
+
+            if not lines:
+                continue
 
             # Ширина блока по максимальной строке
             box_w = max(
@@ -795,7 +819,7 @@ class MapCanvas(QWidget):
 
     def _draw_polygon_labels(self, painter: QPainter):
         """Рисует метки площади в центроиде каждого полигона."""
-        if not self.show_geo_labels or not self.map_polygons:
+        if not self.show_geo_labels or not self.show_area_labels or not self.map_polygons:
             return
         font = QFont("Segoe UI", 8, QFont.Weight.Bold)
         fm   = QFontMetrics(font)
@@ -804,7 +828,7 @@ class MapCanvas(QWidget):
             pts = [self._get_point_by_id(pid) for pid in poly.point_ids]
             if any(p is None for p in pts) or len(pts) < 3:
                 continue
-            area  = self._calc_polygon_area(poly)
+            area  = self._effective_polygon_area(poly)
             if self.area_unit == "ha":
                 lbl = f"{area/10000:.4f} га"
             else:
@@ -1383,6 +1407,9 @@ class MapCanvas(QWidget):
                 if self._drag_was_moved:
                     for pt in self._get_selected_points():
                         self.point_moved.emit(pt)
+                    self._check_interior_subdivisions()
+                    self._deduplicate_polygons()
+                    self._sync_dynamic_points()
                 self._dragging_point    = None
                 self._drag_was_moved    = False
                 self._drag_start_screen = None
@@ -1468,8 +1495,13 @@ class MapCanvas(QWidget):
 
         # H — переключить глобальные метки
         if key == Qt.Key.Key_H and not ctrl:
-            self.show_geo_labels   = not self.show_geo_labels
-            self.show_point_labels = self.show_geo_labels
+            self.show_geo_labels = not self.show_geo_labels
+            on = self.show_geo_labels
+            self.show_point_labels = on
+            self.show_coord_labels = on
+            self.show_angle_labels = on
+            self.show_area_labels = on
+            self.show_edge_length_labels = on
             self.labels_toggled.emit(self.show_geo_labels)
             self.update()
             return
@@ -1651,6 +1683,60 @@ class MapCanvas(QWidget):
             area += xs[i] * ys[j] - xs[j] * ys[i]
         return abs(area) / 2.0
 
+    def _polygon_vertices_as_xy(self, poly: "MapPolygon") -> List[Tuple[float, float]]:
+        """Возвращает вершины полигона в метрах (локальная эквирект. проекция)."""
+        pts = [self._get_point_by_id(pid) for pid in poly.point_ids]
+        pts = [p for p in pts if p is not None]
+        if len(pts) < 3:
+            return []
+        clat = sum(p.lat for p in pts) / len(pts)
+        R = 6_371_000.0
+        cos_lat = math.cos(math.radians(clat))
+        return [
+            (math.radians(p.lon) * R * cos_lat, math.radians(p.lat) * R)
+            for p in pts
+        ]
+
+    def _effective_polygon_area(self, poly: "MapPolygon") -> float:
+        """Площадь полигона без перекрытий (динамическое деление для любых фигур)."""
+        if ShapelyPolygon is None or unary_union is None:
+            return self._calc_polygon_area(poly)
+
+        target_vertices = self._polygon_vertices_as_xy(poly)
+        if len(target_vertices) < 3:
+            return 0.0
+        target_shape = ShapelyPolygon(target_vertices)
+        if target_shape.is_empty or not target_shape.is_valid:
+            return max(0.0, target_shape.buffer(0).area if not target_shape.is_empty else 0.0)
+
+        subtract_shapes = []
+        for other in self.map_polygons:
+            if other.id == poly.id:
+                continue
+            verts = self._polygon_vertices_as_xy(other)
+            if len(verts) < 3:
+                continue
+            shp = ShapelyPolygon(verts)
+            if shp.is_empty:
+                continue
+            if not shp.is_valid:
+                shp = shp.buffer(0)
+            if shp.is_empty:
+                continue
+            subtract_shapes.append(shp)
+
+        if not subtract_shapes:
+            return target_shape.area
+
+        overlap_union = unary_union(subtract_shapes)
+        effective = target_shape.difference(overlap_union)
+        if effective.is_empty:
+            return 0.0
+        return max(0.0, effective.area)
+
+    def _calc_total_effective_area(self) -> float:
+        return sum(self._effective_polygon_area(poly) for poly in self.map_polygons)
+
     # ── Работа с рёбрами ──────────────────────────────────────────
 
     def _find_path(self, adj: Dict[str, set], start: str, end: str) -> Optional[List[str]]:
@@ -1718,7 +1804,9 @@ class MapCanvas(QWidget):
                 break
 
         # Авто-обнаружение пересечений с другими рёбрами → DynamicPoint
-        has_intersection = self._check_new_intersections(edge)
+        has_intersection = False
+        if self.auto_dynamic_points:
+            has_intersection = self._check_new_intersections(edge)
 
         # Авто-полигон по замкнутому циклу (только если разреза не было и нет пересечений)
         if not split_done and not has_intersection and self.auto_polygon:
@@ -1752,6 +1840,10 @@ class MapCanvas(QWidget):
         for e in to_remove:
             self.map_edges.remove(e)
             self.edge_deleted.emit(e)
+
+        if to_remove:
+            self._merge_polygons_by_removed_edges(to_remove)
+
         pt_ids = {p.id for p in self.map_points}
         edge_pairs = (
             {(e.point_a_id, e.point_b_id) for e in self.map_edges}
@@ -1765,6 +1857,8 @@ class MapCanvas(QWidget):
                 for i in range(len(poly.point_ids))
             )
         ]
+        self._deduplicate_polygons()
+        self._sync_dynamic_points()
         self.update()
 
     # ── Работа с полигонами ───────────────────────────────────────
@@ -1883,15 +1977,126 @@ class MapCanvas(QWidget):
                 sector = ids[i_start:] + ids[: i_end + 1]
             sub_ids = [interior_id] + sector
             if len(sub_ids) >= 3:
+                cand_set = set(sub_ids)
+                if any(set(p.point_ids) == cand_set for p in self.map_polygons):
+                    continue
                 self.map_polygons.append(MapPolygon(point_ids=sub_ids, **kw))
+
+    def _deduplicate_polygons(self):
+        """Удаляет дубли полигонов с одинаковым набором вершин."""
+        uniq: List[MapPolygon] = []
+        seen = set()
+        for poly in self.map_polygons:
+            key = frozenset(poly.point_ids)
+            if len(poly.point_ids) < 3 or key in seen:
+                continue
+            seen.add(key)
+            uniq.append(poly)
+        self.map_polygons = uniq
+
+    def _polygon_contains_edge(self, poly: "MapPolygon", a_id: str, b_id: str) -> bool:
+        ids = poly.point_ids
+        n = len(ids)
+        for i in range(n):
+            j = (i + 1) % n
+            if (ids[i], ids[j]) in ((a_id, b_id), (b_id, a_id)):
+                return True
+        return False
+
+    def _long_chain_between_adjacent(self, ids: List[str], start_id: str, end_id: str) -> Optional[List[str]]:
+        """Возвращает длинную цепочку от start_id до end_id (в обход ребра start-end)."""
+        if start_id not in ids or end_id not in ids:
+            return None
+        n = len(ids)
+        if n < 3:
+            return None
+        i_start = ids.index(start_id)
+        i_end = ids.index(end_id)
+
+        fwd = [start_id]
+        i = i_start
+        while i != i_end:
+            i = (i + 1) % n
+            fwd.append(ids[i])
+
+        bwd = [start_id]
+        i = i_start
+        while i != i_end:
+            i = (i - 1 + n) % n
+            bwd.append(ids[i])
+
+        chain = fwd if len(fwd) > len(bwd) else bwd
+        return chain if len(chain) >= 3 else None
+
+    def _merge_polygons_by_removed_edges(self, removed_edges: List["MapEdge"]):
+        """Если удалено внутреннее ребро между полигонами — сливает их в один."""
+        for edge in removed_edges:
+            a_id, b_id = edge.point_a_id, edge.point_b_id
+            while True:
+                candidates = [
+                    p for p in self.map_polygons
+                    if self._polygon_contains_edge(p, a_id, b_id)
+                ]
+                if len(candidates) < 2:
+                    break
+
+                p1, p2 = candidates[0], candidates[1]
+                chain1 = self._long_chain_between_adjacent(p1.point_ids, a_id, b_id)
+                chain2 = self._long_chain_between_adjacent(p2.point_ids, a_id, b_id)
+                if not chain1 or not chain2:
+                    break
+
+                merged_ids = chain1 + list(reversed(chain2))[1:-1]
+                dedup_ids = []
+                for pid in merged_ids:
+                    if not dedup_ids or dedup_ids[-1] != pid:
+                        dedup_ids.append(pid)
+                if len(set(dedup_ids)) < 3:
+                    break
+
+                kw = dict(
+                    fill_color=p1.fill_color,
+                    fill_opacity=p1.fill_opacity,
+                    border_color=p1.border_color,
+                    border_width=p1.border_width,
+                    border_type=p1.border_type,
+                )
+                self.map_polygons.remove(p1)
+                self.map_polygons.remove(p2)
+                self.map_polygons.append(MapPolygon(point_ids=dedup_ids, **kw))
+
+    def _sync_dynamic_points(self):
+        """Синхронизирует динамические точки с текущей геометрией рёбер."""
+        if not self.show_dynamic_points:
+            self.dynamic_points.clear()
+            return
+        if not self.auto_dynamic_points:
+            self._remove_stale_dynamic_points()
+            return
+        self.dynamic_points.clear()
+        for i, ea in enumerate(self.map_edges):
+            for eb in self.map_edges[i + 1:]:
+                if {ea.point_a_id, ea.point_b_id} & {eb.point_a_id, eb.point_b_id}:
+                    continue
+                p1 = self._get_point_by_id(ea.point_a_id)
+                p2 = self._get_point_by_id(ea.point_b_id)
+                p3 = self._get_point_by_id(eb.point_a_id)
+                p4 = self._get_point_by_id(eb.point_b_id)
+                if not (p1 and p2 and p3 and p4):
+                    continue
+                if self._segment_intersection(p1.lat, p1.lon, p2.lat, p2.lon,
+                                              p3.lat, p3.lon, p4.lat, p4.lon) is None:
+                    continue
+                self.dynamic_points.append(DynamicPoint(edge_a_id=ea.id, edge_b_id=eb.id))
     def _check_interior_subdivisions(self):
         """Сканирует все точки: если точка внутри полигона и соединена с 2+ его
         вершинами — разбивает полигон на сектора. Вызывается после connect_selected."""
-        poly_vertex_ids = {vid for p in self.map_polygons for vid in p.point_ids}
+        if not self.show_dynamic_points:
+            return
         for pt in list(self.map_points):
-            if pt.id in poly_vertex_ids:
-                continue   # вершина полигона — пропускаем
             for poly in list(self.map_polygons):
+                if pt.id in poly.point_ids:
+                    continue
                 if self._point_in_polygon_latlon(pt.lat, pt.lon, poly):
                     conn_vids = [
                         vid for vid in poly.point_ids
@@ -1902,10 +2107,7 @@ class MapCanvas(QWidget):
                     ]
                     if len(conn_vids) >= 2:
                         self._subdivide_by_interior(poly, pt.id, conn_vids)
-                        # Обновляем множество вершин
-                        poly_vertex_ids = {
-                            vid for p in self.map_polygons for vid in p.point_ids
-                        }
+                        self._deduplicate_polygons()
                     break
 
     def _create_edge_raw(self, id_a: str, id_b: str) -> "Optional[MapEdge]":
@@ -1924,6 +2126,8 @@ class MapCanvas(QWidget):
         )
         self.map_edges.append(edge)
         self.edge_added.emit(edge)
+        if self.auto_dynamic_points:
+            self._check_new_intersections(edge)
         return edge
     # ── Пересечения рёбер (динамические точки) ────────────────────
 
@@ -2138,6 +2342,8 @@ class MapCanvas(QWidget):
 
     def _draw_dynamic_points(self, painter: QPainter):
         """Рисует динамические точки пересечений (серые, пунктирные круги)."""
+        if not self.show_dynamic_points:
+            return
         self._remove_stale_dynamic_points()
         W, H = self.width(), self.height()
         fnt  = QFont("Segoe UI", 7)
@@ -2248,6 +2454,7 @@ class MapCanvas(QWidget):
                 else:
                     self._chain_start_id = pt.id   # первая точка новой цепи
         self._last_placed_point_id = pt.id
+        self._sync_dynamic_points()
         self.update()
 
     def _delete_map_point(self, pt: MapPoint):
@@ -2824,9 +3031,11 @@ class MapTab(QWidget):
         self.chk_auto_polygon = QCheckBox("Авто-полигон")
         self.chk_auto_polygon.setChecked(self.canvas.auto_polygon)
         self.chk_auto_polygon.toggled.connect(lambda v: setattr(self.canvas, "auto_polygon", v))
-        self.chk_show_labels  = QCheckBox("Метки")
-        self.chk_show_labels.setChecked(self.canvas.show_geo_labels)
-        self.chk_show_labels.toggled.connect(self._on_show_labels_toggled)
+        self.btn_labels_filter = QToolButton()
+        self.btn_labels_filter.setText("Метки ▾")
+        self.btn_labels_filter.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.btn_labels_filter.setToolTip("Фильтр отображения меток на карте")
+        self._build_labels_filter_menu()
         self.btn_create_poly  = QPushButton("Создать")
         self.btn_create_poly.setFixedHeight(22)
         self.btn_create_poly.setToolTip("Создать полигон из выбранных точек")
@@ -2836,10 +3045,26 @@ class MapTab(QWidget):
         self.btn_split_poly.setToolTip("Разрезать полигон по 2 выбранным точкам")
         self.btn_split_poly.clicked.connect(self._split_selected_polygon)
         popt_rl.addWidget(self.chk_auto_polygon)
-        popt_rl.addWidget(self.chk_show_labels)
+        popt_rl.addWidget(self.btn_labels_filter)
         popt_rl.addWidget(self.btn_create_poly)
         popt_rl.addWidget(self.btn_split_poly)
         poly_l.addWidget(popt_row)
+
+        # Динамические точки/разделение при пересечениях
+        dyn_row = QWidget(); dyn_rl = QHBoxLayout(dyn_row)
+        dyn_rl.setContentsMargins(0, 0, 0, 0); dyn_rl.setSpacing(4)
+        self.chk_show_dynamic_points = QCheckBox("Дин. точки")
+        self.chk_show_dynamic_points.setToolTip("Показывать динамические точки пересечений")
+        self.chk_show_dynamic_points.setChecked(self.canvas.show_dynamic_points)
+        self.chk_show_dynamic_points.toggled.connect(self._on_show_dynamic_points_toggled)
+        self.chk_auto_dynamic_points = QCheckBox("Создавать")
+        self.chk_auto_dynamic_points.setToolTip("Создавать динамические точки при любых пересечениях рёбер")
+        self.chk_auto_dynamic_points.setChecked(self.canvas.auto_dynamic_points)
+        self.chk_auto_dynamic_points.toggled.connect(self._on_auto_dynamic_points_toggled)
+        dyn_rl.addWidget(self.chk_show_dynamic_points)
+        dyn_rl.addWidget(self.chk_auto_dynamic_points)
+        dyn_rl.addStretch()
+        poly_l.addWidget(dyn_row)
 
         self.polygon_g.setVisible(False)
         pl.addWidget(self.polygon_g)
@@ -2976,7 +3201,7 @@ class MapTab(QWidget):
         # ─── Полигоны ─────────────────────────────────────────────
         poly_pt_ids: set = set()
         for i, poly in enumerate(c.map_polygons):
-            area     = c._calc_polygon_area(poly)
+            area     = c._effective_polygon_area(poly)
             area_str = (f"{area/10000:.4f} га"
                         if c.area_unit == "ha" else f"{area:.1f} м²")
             poly_item = QTreeWidgetItem(tree,
@@ -3002,9 +3227,17 @@ class MapTab(QWidget):
                                              next_pt.lat, next_pt.lon)
                     d_str = (f"{dist/1000:.3f} км"
                              if dist >= 1000 else f"{dist:.1f} м")
-                    info  = f"{coord_s}   →{bear:.1f}°  {d_str}"
+                    meta = []
+                    if c.show_angle_labels:
+                        meta.append(f"→{bear:.1f}°")
+                    if c.show_edge_length_labels:
+                        meta.append(d_str)
+                    if c.show_coord_labels:
+                        info = f"{coord_s}   {'  '.join(meta)}".rstrip()
+                    else:
+                        info = "  ".join(meta) if meta else "—"
                 else:
-                    info = coord_s
+                    info = coord_s if c.show_coord_labels else "—"
                 pt_item = QTreeWidgetItem(poly_item,
                     [f"  {_ICON_PT} {name}", info])
                 pt_item.setData(0, Qt.ItemDataRole.UserRole, ("point", pt_id))
@@ -3020,7 +3253,7 @@ class MapTab(QWidget):
             pts_root.setForeground(0, QColor("#89b4fa"))
             for pt in lonely:
                 name = pt.label or pt.id[:6]
-                info = f"{pt.lat:.6f}°N  {pt.lon:.6f}°E"
+                info = f"{pt.lat:.6f}°N  {pt.lon:.6f}°E" if c.show_coord_labels else "—"
                 chi  = QTreeWidgetItem(pts_root,
                     [f"  {_ICON_PT} {name}", info])
                 chi.setData(0, Qt.ItemDataRole.UserRole, ("point", pt.id))
@@ -3042,8 +3275,13 @@ class MapTab(QWidget):
                 d_str = f"{dist/1000:.3f} км" if dist >= 1000 else f"{dist:.1f} м"
                 na    = a.label or a.id[:4]
                 nb    = b.label or b.id[:4]
+                edge_meta = []
+                if c.show_edge_length_labels:
+                    edge_meta.append(d_str)
+                if c.show_angle_labels:
+                    edge_meta.append(f"∠{bear:.1f}°")
                 chi   = QTreeWidgetItem(edge_root,
-                    [f"  {na} – {nb}", f"{d_str}  ∠{bear:.1f}°"])
+                    [f"  {na} – {nb}", "  ".join(edge_meta) if edge_meta else "—"])
                 chi.setForeground(1, QColor("#a6adc8"))
 
         tree.resizeColumnToContents(0)
@@ -3452,16 +3690,91 @@ class MapTab(QWidget):
                 poly.border_color = color.name()
             self.canvas.update()
 
-    def _on_show_labels_toggled(self, checked: bool):
-        self.canvas.show_geo_labels   = checked
-        self.canvas.show_point_labels = checked
+    def _build_labels_filter_menu(self):
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background:#1e1e2e; color:#cdd6f4; border:1px solid #45475a; }"
+            "QMenu::item { padding:5px 20px 5px 10px; }"
+            "QMenu::item:selected { background:#313244; }"
+        )
+        self._label_actions = {}
+
+        items = (
+            ("global", "Показывать все метки", "show_geo_labels"),
+            ("coord", "Координаты точек", "show_coord_labels"),
+            ("angle", "Углы поворота", "show_angle_labels"),
+            ("area", "Площади", "show_area_labels"),
+            ("edge", "Длины рёбер", "show_edge_length_labels"),
+        )
+        for key, title, attr in items:
+            act = menu.addAction(title)
+            act.setCheckable(True)
+            act.setChecked(bool(getattr(self.canvas, attr)))
+            act.toggled.connect(lambda checked, k=key: self._on_label_filter_changed(k, checked))
+            self._label_actions[key] = act
+
+        self.btn_labels_filter.setMenu(menu)
+
+    def _on_label_filter_changed(self, key: str, checked: bool):
+        if key == "global":
+            self.canvas.show_geo_labels = checked
+            if checked:
+                self.canvas.show_point_labels = True
+                if not self.canvas.show_coord_labels and not self.canvas.show_angle_labels:
+                    self.canvas.show_coord_labels = True
+                if not self.canvas.show_area_labels and not self.canvas.show_edge_length_labels:
+                    self.canvas.show_area_labels = True
+            else:
+                self.canvas.show_point_labels = False
+            self._sync_label_filter_menu()
+            self.canvas.update()
+            self._refresh_obj_list()
+            return
+
+        mapping = {
+            "coord": "show_coord_labels",
+            "angle": "show_angle_labels",
+            "area": "show_area_labels",
+            "edge": "show_edge_length_labels",
+        }
+        attr = mapping.get(key)
+        if not attr:
+            return
+
+        setattr(self.canvas, attr, checked)
+        self.canvas.show_point_labels = self.canvas.show_coord_labels or self.canvas.show_angle_labels
+        self.canvas.show_geo_labels = (
+            self.canvas.show_point_labels
+            or self.canvas.show_area_labels
+            or self.canvas.show_edge_length_labels
+        )
+        self._sync_label_filter_menu()
         self.canvas.update()
+        self._refresh_obj_list()
+
+    def _sync_label_filter_menu(self):
+        if not hasattr(self, "_label_actions"):
+            return
+        current = {
+            "global": self.canvas.show_geo_labels,
+            "coord": self.canvas.show_coord_labels,
+            "angle": self.canvas.show_angle_labels,
+            "area": self.canvas.show_area_labels,
+            "edge": self.canvas.show_edge_length_labels,
+        }
+        for key, value in current.items():
+            act = self._label_actions.get(key)
+            if act is None:
+                continue
+            act.blockSignals(True)
+            act.setChecked(bool(value))
+            act.blockSignals(False)
 
     def _on_labels_toggled(self, checked: bool):
-        """Обновляет чекбокс «Метки» при переключении через H-key."""
-        self.chk_show_labels.blockSignals(True)
-        self.chk_show_labels.setChecked(checked)
-        self.chk_show_labels.blockSignals(False)
+        """Синхронизирует меню фильтра меток при переключении через H-key."""
+        _ = checked
+        self._sync_label_filter_menu()
+        self._refresh_obj_list()
 
     def _create_polygon_from_selected(self):
         self.canvas.create_polygon_from_selected()
@@ -3508,7 +3821,7 @@ class MapTab(QWidget):
         self.lbl_total_length.setText(f"Рёбра: {len_str}")
 
         polys       = self.canvas.map_polygons
-        total_area  = sum(self.canvas._calc_polygon_area(p) for p in polys)
+        total_area  = self.canvas._calc_total_effective_area()
         if self.canvas.area_unit == "ha":
             area_str = f"{total_area / 10_000:.4f} га"
         else:
