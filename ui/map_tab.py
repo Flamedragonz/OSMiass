@@ -1683,13 +1683,17 @@ class MapCanvas(QWidget):
             area += xs[i] * ys[j] - xs[j] * ys[i]
         return abs(area) / 2.0
 
-    def _polygon_vertices_as_xy(self, poly: "MapPolygon") -> List[Tuple[float, float]]:
-        """Возвращает вершины полигона в метрах (локальная эквирект. проекция)."""
+    def _polygon_vertices_as_xy(
+        self,
+        poly: "MapPolygon",
+        ref_lat: Optional[float] = None,
+    ) -> List[Tuple[float, float]]:
+        """Возвращает вершины полигона в метрах (эквирект. проекция с общим ref_lat)."""
         pts = [self._get_point_by_id(pid) for pid in poly.point_ids]
         pts = [p for p in pts if p is not None]
         if len(pts) < 3:
             return []
-        clat = sum(p.lat for p in pts) / len(pts)
+        clat = ref_lat if ref_lat is not None else sum(p.lat for p in pts) / len(pts)
         R = 6_371_000.0
         cos_lat = math.cos(math.radians(clat))
         return [
@@ -1702,22 +1706,28 @@ class MapCanvas(QWidget):
         if ShapelyPolygon is None or unary_union is None:
             return self._calc_polygon_area(poly)
 
-        target_vertices = self._polygon_vertices_as_xy(poly)
+        target_pts = [self._get_point_by_id(pid) for pid in poly.point_ids]
+        target_pts = [p for p in target_pts if p is not None]
+        if len(target_pts) < 3:
+            return 0.0
+
+        ref_lat = sum(p.lat for p in target_pts) / len(target_pts)
+        target_vertices = self._polygon_vertices_as_xy(poly, ref_lat=ref_lat)
         if len(target_vertices) < 3:
             return 0.0
         target_shape = ShapelyPolygon(target_vertices)
         if target_shape.is_empty or not target_shape.is_valid:
             return max(0.0, target_shape.buffer(0).area if not target_shape.is_empty else 0.0)
 
+        try:
+            target_idx = self.map_polygons.index(poly)
+        except ValueError:
+            target_idx = -1
+
         subtract_shapes = []
-        for other in self.map_polygons:
-            if other.id == poly.id:
-                continue
-            verts = self._polygon_vertices_as_xy(other)
+        for other in self.map_polygons[target_idx + 1:]:
+            verts = self._polygon_vertices_as_xy(other, ref_lat=ref_lat)
             if len(verts) < 3:
-                continue
-            shp = ShapelyPolygon(verts)
-            if shp.is_empty:
                 continue
             if not shp.is_valid:
                 shp = shp.buffer(0)
