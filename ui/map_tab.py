@@ -2119,7 +2119,20 @@ class MapCanvas(QWidget):
         вершинами — разбивает полигон на сектора. Вызывается после connect_selected."""
         if not self.show_dynamic_points:
             return
+
+        # Если точка уже является вершиной какого-либо полигона, не нужно
+        # автоматически делить другие полигоны через неё. Иначе при временном
+        # заходе «прилегающей» точки внутрь соседней фигуры можно получить
+        # накопление площади (большой полигон + отдельный треугольник).
+        polygon_vertex_ids = {
+            pid
+            for poly in self.map_polygons
+            for pid in poly.point_ids
+        }
+
         for pt in list(self.map_points):
+            if pt.id in polygon_vertex_ids:
+                continue
             for poly in list(self.map_polygons):
                 if pt.id in poly.point_ids:
                     continue
