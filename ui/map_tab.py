@@ -31,22 +31,6 @@ from PyQt6.QtGui import (
     QBrush, QWheelEvent, QMouseEvent, QPolygonF, QPainterPath,
 )
 
-# Для вычисления операций над полигонами (разность, пересечение и т.п.)
-# используем shapely — добавляем в requirements.txt
-try:
-    from shapely.geometry import Polygon as ShapelyPolygon, MultiPolygon
-    from shapely.ops import unary_union
-except ImportError:
-    ShapelyPolygon = None  # в случае отсутствия библиотека функциональность будет ограничена
-    MultiPolygon = None
-    unary_union = None
-
-# sip требуется для проверки, не был ли объект уничтожён
-try:
-    import sip
-except ImportError:
-    sip = None
-
 from core.config import Config
 
 
@@ -358,7 +342,6 @@ class MapCanvas(QWidget):
     edge_added        = pyqtSignal(object)   # MapEdge
     edge_deleted      = pyqtSignal(object)   # MapEdge
     labels_toggled    = pyqtSignal(bool)     # при переключении глобальных меток (H)
-    dynamic_flags_changed = pyqtSignal()       # когда были изменены настройки динамических точек/сплита
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -438,18 +421,6 @@ class MapCanvas(QWidget):
 
         # Динамические точки пересечений рёбер
         self.dynamic_points: List[DynamicPoint] = []
-        # включение/отображение динамических точек и автоматического разбиения
-        self.dynamic_points_enabled: bool = True
-        self.dynamic_split_enabled: bool  = False
-        # вспомогатели с сигналами (вдруг кто-то меняет их напрямую)
-        def _set_dyn_enabled(v: bool):
-            self.dynamic_points_enabled = v
-            self.dynamic_flags_changed.emit()
-        def _set_dyn_split(v: bool):
-            self.dynamic_split_enabled = v
-            self.dynamic_flags_changed.emit()
-        self._set_dyn_enabled = _set_dyn_enabled
-        self._set_dyn_split   = _set_dyn_split
 
         # R-поворот мышью
         self._rotate_mode:          bool                       = False
@@ -524,11 +495,7 @@ class MapCanvas(QWidget):
                     self.markers.append((lat, lon, label, "#f38ba8"))
                 except ValueError:
                     pass
-        # защищённый вызов обновления — виджет мог уже быть разрушен
-        try:
-            self.update()
-        except RuntimeError:
-            pass
+        self.update()
 
     # ── Отрисовка ────────────────────────────────────────────────
 
@@ -1751,10 +1718,7 @@ class MapCanvas(QWidget):
                 break
 
         # Авто-обнаружение пересечений с другими рёбрами → DynamicPoint
-        has_intersection = False
-        # Авто-обнаружение пересечений с другими рёбрами → DynamicPoint
-        if self.dynamic_points_enabled:
-            has_intersection = self._check_new_intersections(edge)
+        has_intersection = self._check_new_intersections(edge)
 
         # Авто-полигон по замкнутому циклу (только если разреза не было и нет пересечений)
         if not split_done and not has_intersection and self.auto_polygon:
@@ -1762,9 +1726,6 @@ class MapCanvas(QWidget):
             if new_poly is not None:
                 self.map_polygons.append(new_poly)
 
-        # если включено динамическое разделение, попробуем убрать накладки
-        if self.dynamic_split_enabled:
-            self._resolve_overlaps()
         return edge
 
     def connect_selected_points(self):
@@ -1781,19 +1742,13 @@ class MapCanvas(QWidget):
         self.update()
 
     def delete_edges_for_selection(self):
-        """Удаляет рёбра, у которых хотя бы один конец выбран.  Если удаляемое ребро
-        раньше служило границей между двумя полигонами, пытаемся объединить их.
-        """
+        """Удаляет рёбра, у которых хотя бы один конец выбран."""
         self._push_undo()
         to_remove = [
             e for e in self.map_edges
             if e.point_a_id in self.selected_point_ids
             or e.point_b_id in self.selected_point_ids
         ]
-        # сохраним ориентированные пары удалённых рёбер для последующего слияния
-        removed_pairs = [(e.point_a_id, e.point_b_id) for e in to_remove]
-        # также сохраним полигон, которые станут недействительными
-        old_polys = list(self.map_polygons)
         for e in to_remove:
             self.map_edges.remove(e)
             self.edge_deleted.emit(e)
@@ -1802,77 +1757,14 @@ class MapCanvas(QWidget):
             {(e.point_a_id, e.point_b_id) for e in self.map_edges}
             | {(e.point_b_id, e.point_a_id) for e in self.map_edges}
         )
-        # отфильтруем полигоны, потерявшие ребра
-        valid_polys = []
-        removed_polys = []
-        for poly in old_polys:
-            if not all(pid in pt_ids for pid in poly.point_ids):
-                removed_polys.append(poly)
-                continue
-            if all(
+        self.map_polygons = [
+            poly for poly in self.map_polygons
+            if all(pid in pt_ids for pid in poly.point_ids)
+            and all(
                 (poly.point_ids[i], poly.point_ids[(i + 1) % len(poly.point_ids)]) in edge_pairs
                 for i in range(len(poly.point_ids))
-            ):
-                valid_polys.append(poly)
-            else:
-                removed_polys.append(poly)
-        # попытаемся объединить парами удалённых полигонов по каждому удалённому ребру
-        for a, b in removed_pairs:
-            # ищем пары удалённых полигонов, которые содержали a->b / b->a
-            match = []
-            for poly in removed_polys:
-                ids = poly.point_ids
-                for i in range(len(ids)):
-                    nxt = ids[(i + 1) % len(ids)]
-                    if (ids[i] == a and nxt == b) or (ids[i] == b and nxt == a):
-                        match.append((poly, ids[i] == a and nxt == b))
-                        break
-            if len(match) == 2:
-                # два полигона с противоположной ориентацией
-                p1, ori1 = match[0]
-                p2, ori2 = match[1]
-                # ориентации должны противоположные
-                if ori1 == ori2:
-                    continue
-                # сформируем набор граней, исключая удалённое ребро
-                def edges_from(poly):
-                    ids = poly.point_ids
-                    return [
-                        (ids[i], ids[(i + 1) % len(ids)])
-                        for i in range(len(ids))
-                        if not ({ids[i], ids[(i + 1) % len(ids)]} == {a, b})
-                    ]
-                union_edges = edges_from(p1) + edges_from(p2)
-                # постройте цикл из union_edges
-                adj: Dict[str, set] = {}
-                for u, v in union_edges:
-                    adj.setdefault(u, set()).add(v)
-                    adj.setdefault(v, set()).add(u)
-                # найдём цикл
-                if not adj:
-                    continue
-                start = next(iter(adj))
-                cycle = [start]
-                prev = None
-                curr = start
-                while True:
-                    nbrs = adj[curr] - ({prev} if prev is not None else set())
-                    if not nbrs:
-                        break
-                    nxt = next(iter(nbrs))
-                    if nxt == start:
-                        break
-                    cycle.append(nxt)
-                    prev, curr = curr, nxt
-                if len(cycle) >= 3:
-                    merged = MapPolygon(point_ids=cycle)
-                    valid_polys.append(merged)
-                # не будем повторно обрабатывать эти два полигона
-                removed_polys.remove(p1)
-                removed_polys.remove(p2)
-        self.map_polygons = valid_polys
-        if self.dynamic_split_enabled:
-            self._resolve_overlaps()
+            )
+        ]
         self.update()
 
     # ── Работа с полигонами ───────────────────────────────────────
@@ -1904,8 +1796,6 @@ class MapCanvas(QWidget):
             "edges":    copy.deepcopy(self.map_edges),
             "polygons": copy.deepcopy(self.map_polygons),
             "dynamic":  copy.deepcopy(self.dynamic_points),
-            "dyn_enabled": self.dynamic_points_enabled,
-            "dyn_split":   self.dynamic_split_enabled,
         }
 
     def _push_undo(self):
@@ -1919,11 +1809,6 @@ class MapCanvas(QWidget):
         self.map_edges     = snap["edges"]
         self.map_polygons  = snap["polygons"]
         self.dynamic_points = snap.get("dynamic", [])
-        # восстановим настройки динамики, если они в снапшоте
-        self.dynamic_points_enabled = snap.get("dyn_enabled", True)
-        self.dynamic_split_enabled  = snap.get("dyn_split", False)
-        # уведомляем слушателей (например, MapTab) о том, что флаги поменялись
-        self.dynamic_flags_changed.emit()
         self.selected_point_ids.clear()
         self._hovered_point_id  = None
         self._hovered_edge_id   = None
@@ -2098,7 +1983,6 @@ class MapCanvas(QWidget):
         return found
     def _remove_stale_dynamic_points(self):
         """Удаляет DynamicPoint-ы, чьи рёбра уже не существуют или не пересекаются."""
-        # сначала отфильтруем устаревшие точки
         edge_ids = {e.id for e in self.map_edges}
         self.dynamic_points = [
             dp for dp in self.dynamic_points
@@ -2106,42 +1990,6 @@ class MapCanvas(QWidget):
             and dp.edge_b_id in edge_ids
             and self._compute_dynamic_pos(dp) is not None
         ]
-        # если функция отключена — сразу выходим (точки не создаём)
-        if not self.dynamic_points_enabled:
-            # очистим уже имеющиеся
-            self.dynamic_points.clear()
-            return
-        # просканируем все пары рёбер для новых пересечений
-        for i, e1 in enumerate(self.map_edges):
-            for e2 in self.map_edges[i + 1:]:
-                # пропускаем соседние
-                if {e1.point_a_id, e1.point_b_id} & {e2.point_a_id, e2.point_b_id}:
-                    continue
-                key = frozenset([e1.id, e2.id])
-                if any(frozenset([dp.edge_a_id, dp.edge_b_id]) == key
-                       for dp in self.dynamic_points):
-                    continue
-                p1 = self._get_point_by_id(e1.point_a_id)
-                p2 = self._get_point_by_id(e1.point_b_id)
-                p3 = self._get_point_by_id(e2.point_a_id)
-                p4 = self._get_point_by_id(e2.point_b_id)
-                if not (p1 and p2 and p3 and p4):
-                    continue
-                r = self._segment_intersection(
-                    p1.lat, p1.lon, p2.lat, p2.lon,
-                    p3.lat, p3.lon, p4.lat, p4.lon,
-                )
-                if not r:
-                    continue
-                dp = DynamicPoint(edge_a_id=e1.id, edge_b_id=e2.id)
-                if self.dynamic_split_enabled:
-                    # автоматически подтверждаем: делим ребра и полигоны
-                    self._confirm_dynamic_point(dp)
-                else:
-                    self.dynamic_points.append(dp)
-        # если включено динамическое разбиение, приводим полигоны в порядок
-        if self.dynamic_split_enabled:
-            self._resolve_overlaps()
 
     def _compute_dynamic_pos(self,
                              dp: "DynamicPoint",
@@ -2162,126 +2010,6 @@ class MapCanvas(QWidget):
             p3.lat, p3.lon, p4.lat, p4.lon,
         )
         return (r[2], r[3]) if r else None
-
-    # helpers for shapely-based polygon arithmetic
-    def _polygon_to_shapely(self, poly: "MapPolygon"):
-        """Конвертирует MapPolygon в shapely Polygon (lon,lat).
-        Возвращает None если shapely не доступен или полигон неполный."""
-        if ShapelyPolygon is None:
-            return None
-        coords = []
-        for vid in poly.point_ids:
-            pt = self._get_point_by_id(vid)
-            if pt is None:
-                return None
-            coords.append((pt.lon, pt.lat))
-        try:
-            return ShapelyPolygon(coords)
-        except Exception:
-            return None
-
-    def _create_polygon_from_shapely(self, geom):
-        """Преобразует shapely Polygon в MapPolygon, создавая/восстанавливая
-        MapPoint и MapEdge по необходимости."""
-        # извлекаем координаты без повторяющегося последнего
-        exterior = list(geom.exterior.coords)
-        if not exterior:
-            return None
-        if exterior[0] == exterior[-1]:
-            exterior = exterior[:-1]
-        ids: List[str] = []
-        for lon, lat in exterior:
-            # ищем точку с такими координатами
-            found = None
-            for pt in self.map_points:
-                if abs(pt.lat - lat) < 1e-9 and abs(pt.lon - lon) < 1e-9:
-                    found = pt
-                    break
-            if not found:
-                new_pt = MapPoint(lat=lat, lon=lon, label="", color="#6c7086",
-                                  icon_type="circle", size=0.8)
-                self.map_points.append(new_pt)
-                self.point_added.emit(new_pt)
-                ids.append(new_pt.id)
-            else:
-                ids.append(found.id)
-        # добавляем ребра по периметру
-        n = len(ids)
-        for i in range(n):
-            a, b = ids[i], ids[(i + 1) % n]
-            if not any({e.point_a_id, e.point_b_id} == {a, b}
-                       for e in self.map_edges):
-                self._create_edge(a, b)
-        return MapPolygon(point_ids=ids)
-
-    def _resolve_overlaps(self):
-        """Если включено dynamic_split_enabled, разбивает/вычитает
-        пересекающиеся полигоны так, чтобы не было наложений.
-        Алгоритм: для каждой пары полигонов ищем пересечение, затем вычитаем
-        из *большего* полигонную часть, которая находится внутри меньшего.
-        Результат может дать несколько новых полигонов.
-        """
-        # разделение работает только если включены и динамические точки, и сам сплит,
-        # и библиотека shapely доступна
-        if not self.dynamic_split_enabled or not self.dynamic_points_enabled or ShapelyPolygon is None:
-            return
-        # повторяем цикл до тех пор, пока есть пересечения
-        changed = True
-        while changed:
-            changed = False
-            n = len(self.map_polygons)
-            for i in range(n):
-                for j in range(i + 1, n):
-                    pi = self.map_polygons[i]
-                    pj = self.map_polygons[j]
-                    gi = self._polygon_to_shapely(pi)
-                    gj = self._polygon_to_shapely(pj)
-                    if gi is None or gj is None:
-                        continue
-                    if not gi.intersects(gj):
-                        continue
-                    inter = gi.intersection(gj)
-                    if inter.is_empty:
-                        continue
-                    # выбираем, из какого полигона вычитать
-                    if gi.area >= gj.area:
-                        larger, larger_geom = pi, gi
-                    else:
-                        larger, larger_geom = pj, gj
-                    new_geom = larger_geom.difference(inter)
-                    # удаляем исходный большой полигон
-                    if larger in self.map_polygons:
-                        self.map_polygons.remove(larger)
-                    # породим новые полигоны
-                    parts = []
-                    if isinstance(new_geom, MultiPolygon):
-                        parts = list(new_geom)
-                    else:
-                        parts = [new_geom]
-                    for part in parts:
-                        new_poly = self._create_polygon_from_shapely(part)
-                        if new_poly is not None:
-                            self.map_polygons.append(new_poly)
-                    changed = True
-                    break
-                if changed:
-                    break
-            # цикл повторится, чтобы обработать новые пересечения
-        # после того как мы перераспределили полигоны, удалим рёбра, которые больше
-        # ни к одному полигону не принадлежат (иначе остаются «лишние» внутренние)
-        used_pairs = set()
-        for poly in self.map_polygons:
-            ids = poly.point_ids
-            for i in range(len(ids)):
-                used_pairs.add((ids[i], ids[(i + 1) % len(ids)]))
-        # дополняем обратными направлениями
-        used_pairs |= {(b, a) for (a, b) in used_pairs}
-        self.map_edges = [
-            e for e in self.map_edges
-            if (e.point_a_id, e.point_b_id) in used_pairs
-        ]
-        # пересчитаем подписи/площадь
-        self._update_geo_labels()
 
     def _find_dynamic_point_at(self, sx: float, sy: float,
                                radius: int = 14) -> "Optional[DynamicPoint]":  # type: ignore
@@ -2367,8 +2095,6 @@ class MapCanvas(QWidget):
                        for e in self.map_edges):
                     self._split_polygon_only(poly, new_pt.id, vid)
                     break
-        if self.dynamic_split_enabled:
-            self._resolve_overlaps()
         self.update()
     def _revert_intersection_point(self, pt: MapPoint):
         """Возвращает подтверждённую точку пересечения в режим динамической."""
@@ -2412,8 +2138,6 @@ class MapCanvas(QWidget):
 
     def _draw_dynamic_points(self, painter: QPainter):
         """Рисует динамические точки пересечений (серые, пунктирные круги)."""
-        if not self.dynamic_points_enabled:
-            return
         self._remove_stale_dynamic_points()
         W, H = self.width(), self.height()
         fnt  = QFont("Segoe UI", 7)
@@ -2690,10 +2414,6 @@ class MapTab(QWidget):
             "QWidget#map_panel { border-top: 1px solid #313244; }"
         )
         panel.setObjectName("map_panel")
-        # без минимальной высоты панель управления схлопывается до одной
-        # горизонтальной линии (см. баг, когда окно выглядит пустым);
-        # задаём разумный минимум, чтобы элементы всегда были видны.
-        panel.setMinimumHeight(100)
 
         pl = QHBoxLayout(panel)
         pl.setContentsMargins(10, 6, 10, 6)
@@ -3104,24 +2824,6 @@ class MapTab(QWidget):
         self.chk_auto_polygon = QCheckBox("Авто-полигон")
         self.chk_auto_polygon.setChecked(self.canvas.auto_polygon)
         self.chk_auto_polygon.toggled.connect(lambda v: setattr(self.canvas, "auto_polygon", v))
-        self.chk_dynamic_points = QCheckBox("Динамические точки")
-        self.chk_dynamic_points.setChecked(self.canvas.dynamic_points_enabled)
-        self.chk_dynamic_points.setToolTip("Создавать и показывать точки пересечения рёбер")
-        self.chk_dynamic_points.toggled.connect(lambda v: (
-            self.canvas._set_dyn_enabled(v),
-            self.canvas.dynamic_points.clear(),
-            self.canvas.update(),
-            self.chk_dynamic_split.setEnabled(v)  # сплит только когда точки отображаются
-        ))
-        self.chk_dynamic_split = QCheckBox("Динамическое деление")
-        self.chk_dynamic_split.setChecked(self.canvas.dynamic_split_enabled)
-        self.chk_dynamic_split.setEnabled(self.canvas.dynamic_points_enabled)
-        self.chk_dynamic_split.setToolTip("Автоматически разбивать/вычитать области при пересечении")
-        self.chk_dynamic_split.toggled.connect(lambda v: (
-            self.canvas._set_dyn_split(v),
-            self.canvas._resolve_overlaps(),
-            self.canvas.update()
-        ))
         self.chk_show_labels  = QCheckBox("Метки")
         self.chk_show_labels.setChecked(self.canvas.show_geo_labels)
         self.chk_show_labels.toggled.connect(self._on_show_labels_toggled)
@@ -3134,13 +2836,9 @@ class MapTab(QWidget):
         self.btn_split_poly.setToolTip("Разрезать полигон по 2 выбранным точкам")
         self.btn_split_poly.clicked.connect(self._split_selected_polygon)
         popt_rl.addWidget(self.chk_auto_polygon)
-        popt_rl.addWidget(self.chk_dynamic_points)
-        popt_rl.addWidget(self.chk_dynamic_split)
         popt_rl.addWidget(self.chk_show_labels)
         popt_rl.addWidget(self.btn_create_poly)
         popt_rl.addWidget(self.btn_split_poly)
-        # если настройки динамики в canvas изменятся извне (undo/redo), синхронизируем чекбоксы
-        self.canvas.dynamic_flags_changed.connect(self._sync_dynamic_flags)
         poly_l.addWidget(popt_row)
 
         self.polygon_g.setVisible(False)
@@ -3149,15 +2847,6 @@ class MapTab(QWidget):
         # ─── Геометрия (суммарная статистика) ────────────────────
         self.geo_g = QGroupBox("Геометрия")
         self.geo_g.setStyleSheet(_gs)
-
-    def _sync_dynamic_flags(self):
-        """Обновляет состояние чекбоксов, чтобы отражать значения в canvas.
-        Вызывается после undo/redo, когда динамические флаги восстанавливаются.
-        """
-        self.chk_dynamic_points.setChecked(self.canvas.dynamic_points_enabled)
-        self.chk_dynamic_split.setChecked(self.canvas.dynamic_split_enabled)
-        # динамический сплит доступен только если точки отображаются
-        self.chk_dynamic_split.setEnabled(self.canvas.dynamic_points_enabled)
         geo_l = QVBoxLayout(self.geo_g)
         geo_l.setContentsMargins(6, 10, 6, 6)
         geo_l.setSpacing(4)
@@ -3420,16 +3109,6 @@ class MapTab(QWidget):
 
     # ── Загрузка баз данных ──────────────────────────────────────
 
-    def closeEvent(self, event):
-        """При закрытии вкладки
-auto-close all database connections to prevent thread warnings."""
-        for prov in self._providers:
-            try:
-                prov.close()
-            except Exception:
-                pass
-        super().closeEvent(event)
-
     def _load_databases(self):
         osm_dir = "osm_map"
         if not os.path.isdir(osm_dir):
@@ -3453,9 +3132,6 @@ auto-close all database connections to prevent thread warnings."""
 
         configs.sort(key=lambda c: c[3])   # bottom → top по полю order
 
-        # если layout уже удалён (например, окно закрывается), не продолжаем
-        if not hasattr(self, "layers_vl") or self.layers_vl is None:
-            return
         for fname, display_name, default_opacity, _ in configs:
             path = os.path.join(osm_dir, fname)
             try:
@@ -3465,18 +3141,11 @@ auto-close all database connections to prevent thread warnings."""
                 self._providers.append(prov)
 
                 row_w = self._make_layer_row(layer)
-                try:
-                    self.layers_vl.addWidget(row_w)
-                except RuntimeError:
-                    # если layout/parent был удалён посередине, прекращаем
-                    return
+                self.layers_vl.addWidget(row_w)
             except Exception as e:
                 print(f"[MapTab] Ошибка загрузки {fname}: {e}")
-        # добавляем растяжитель; оборачиваем, чтобы не падать при удалении
-        try:
-            self.layers_vl.addStretch()
-        except RuntimeError:
-            pass
+
+        self.layers_vl.addStretch()
 
         if self.canvas.layers:
             self._center_on_coverage()
@@ -3613,45 +3282,23 @@ auto-close all database connections to prevent thread warnings."""
         self._update_insert_status()
 
     def _update_insert_status(self):
-        # label может быть уничтожен вместе с вкладкой
-        if not hasattr(self, "lbl_insert_status") or self.lbl_insert_status is None:
-            return
-        if sip is not None and sip.isdeleted(self.lbl_insert_status):
-            return
-        # data_tab тоже может отсутствовать во время закрытия
-        if not hasattr(self, "data_tab") or self.data_tab is None:
-            return
-
         if self._insert_sequential:
             rows = self.data_tab.get_rows()
             for i in range(self._next_row_idx, len(rows)):
                 if not rows[i].get("широта", "").strip():
-                    try:
-                        self.lbl_insert_status.setText(f"Следующая строка: {i + 1}")
-                    except RuntimeError:
-                        pass
+                    self.lbl_insert_status.setText(f"Следующая строка: {i + 1}")
                     return
-            try:
-                self.lbl_insert_status.setText(f"Все строки заполнены ({len(rows)})")
-            except RuntimeError:
-                pass
+            self.lbl_insert_status.setText(f"Все строки заполнены ({len(rows)})")
         else:
             selected = self.data_tab.table.selectedIndexes()
             if selected:
-                try:
-                    self.lbl_insert_status.setText(
-                        f"Выбрана строка: {selected[0].row() + 1}"
-                    )
-                except RuntimeError:
-                    pass
+                self.lbl_insert_status.setText(
+                    f"Выбрана строка: {selected[0].row() + 1}"
+                )
             else:
-                try:
-                    self.lbl_insert_status.setText("Строка не выбрана")
-                except RuntimeError:
-                    pass
+                self.lbl_insert_status.setText("Строка не выбрана")
 
     def _refresh_markers(self):
-        # обновление маркеров; update_markers сам справится с уничтоженным canvas
         rows = self.data_tab.get_rows()
         self.canvas.update_markers(rows)
         self._update_insert_status()
@@ -3697,15 +3344,7 @@ auto-close all database connections to prevent thread warnings."""
             self._sync_zoom_label()
 
     def _sync_zoom_label(self):
-        # zoom_lbl может быть уничтожен вместе с панелью
-        if not hasattr(self, "zoom_lbl") or self.zoom_lbl is None:
-            return
-        if sip is not None and sip.isdeleted(self.zoom_lbl):
-            return
-        try:
-            self.zoom_lbl.setText(str(self.canvas.zoom))
-        except RuntimeError:
-            pass
+        self.zoom_lbl.setText(str(self.canvas.zoom))
 
     # ── Система точек: обработчики сигналов ─────────────────────
 
@@ -3713,9 +3352,6 @@ auto-close all database connections to prevent thread warnings."""
         """Вызывается при добавлении или перемещении точки."""
         self._update_pts_count()
         self._fill_point_props(pt)
-        if self.canvas.dynamic_split_enabled:
-            # попытка автоматически устранить наложения (если shapely доступен)
-            self.canvas._resolve_overlaps()
         self._update_geo_labels()
 
     def _on_point_deleted(self, pt: MapPoint):
@@ -4025,9 +3661,5 @@ auto-close all database connections to prevent thread warnings."""
 
     def refresh(self):
         """Вызывается при переключении на вкладку."""
-        # обновляем содержимое; внутренние методы защищены сами
         self._refresh_markers()
-        # zoom_lbl может уже быть удалён
-        if hasattr(self, "zoom_lbl") and self.zoom_lbl is not None:
-            if not (sip is not None and sip.isdeleted(self.zoom_lbl)):
-                self._sync_zoom_label()
+        self._sync_zoom_label()
