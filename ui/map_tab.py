@@ -1729,6 +1729,12 @@ class MapCanvas(QWidget):
             verts = self._polygon_vertices_as_xy(other, ref_lat=ref_lat)
             if len(verts) < 3:
                 continue
+            try:
+                shp = ShapelyPolygon(verts)
+            except Exception:
+                continue
+            if shp.is_empty:
+                continue
             if not shp.is_valid:
                 shp = shp.buffer(0)
             if shp.is_empty:
@@ -1737,12 +1743,6 @@ class MapCanvas(QWidget):
 
         if not subtract_shapes:
             return target_shape.area
-
-        overlap_union = unary_union(subtract_shapes)
-        effective = target_shape.difference(overlap_union)
-        if effective.is_empty:
-            return 0.0
-        return max(0.0, effective.area)
 
     def _calc_total_effective_area(self) -> float:
         return sum(self._effective_polygon_area(poly) for poly in self.map_polygons)
