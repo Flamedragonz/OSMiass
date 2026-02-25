@@ -1,0 +1,50 @@
+{
+  "photo_dir": "photo",
+  "output_dir": "output",
+  "watermark_path": "watermark/watermark.png",
+  "csv_path": "gps.csv",
+  "mode": "lesoseka",
+  "resize_enabled": true,
+  "resize_width": 1280,
+  "resize_height": 720,
+  "resize_mode": "crop",
+  "font_name": "arial.ttf",
+  "font_size": 22,
+  "text_squash_y": 1.025,
+  "line_spacing": 6,
+  "box_opacity": 128,
+  "box_padding": 3,
+  "box_extra_width": 10,
+  "margin_left": 3,
+  "margin_bottom": 4,
+  "text_color": [
+    0,
+    0,
+    0,
+    255
+  ],
+  "box_color": [
+    255,
+    255,
+    255
+  ],
+  "scale_base": 1000,
+  "scale_multiplier": 1.35,
+  "wm_enabled": true,
+  "wm_ratio": 0.21,
+  "wm_margin_x": 20,
+  "wm_margin_y": -4,
+  "jpeg_quality": 95,
+  "output_name_template": "кв {квартал} выдел {выдел}.jpg",
+  "sort_mode": "points",
+  "line_template": [
+    "Широта: {широта}",
+    "Долгота: {долгота}",
+    "Точность: {точность} м",
+    "Время: {дата} {время}"
+  ],
+  "interval_min": 5,
+  "interval_max": 7,
+  "accuracy_min": 1.3,
+  "accuracy_max": 14.7
+}
