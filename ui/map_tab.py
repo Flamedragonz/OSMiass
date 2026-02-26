@@ -2688,6 +2688,10 @@ class MapTab(QWidget):
         self.btn_search.clicked.connect(self._on_search)
         sg_l.addWidget(self.btn_search)
 
+        self.chk_search_add_point = QCheckBox("С точкой")
+        self.chk_search_add_point.setChecked(False)
+        sg_l.addWidget(self.chk_search_add_point)
+
         pl.addWidget(search_g)
 
         # ─── Слои ────────────────────────────────────────────────
@@ -3443,6 +3447,8 @@ class MapTab(QWidget):
                 lon = float(parts[1])
                 if -90 <= lat <= 90 and -180 <= lon <= 180:
                     self.canvas.set_center(lat, lon)
+                    if self.chk_search_add_point.isChecked():
+                        self.canvas._add_map_point_at(lat, lon)
                     self._sync_zoom_label()
                     self.search_edit.setStyleSheet("")
                     return
