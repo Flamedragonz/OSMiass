@@ -420,6 +420,13 @@ class MapCanvas(QWidget):
         self.default_edge_opacity = 1.0
         self.auto_connect         = False
 
+        # Настройки по умолчанию для новых полигонов
+        self.default_poly_fill         = "#89b4fa"
+        self.default_poly_fill_opacity = 0.25
+        self.default_poly_border       = "#89b4fa"
+        self.default_poly_border_width = 1.5
+        self.default_poly_border_type  = "solid"
+
         # Визуализация / глобальные метки (H-key)
         self._hovered_edge_id: Optional[str] = None
         self.show_point_labels: bool = False   # True = показывать тултип для всех точек
@@ -3105,6 +3112,7 @@ class MapTab(QWidget):
         self.poly_border_type_combo.setMaximumWidth(90)
         for ru in EDGE_TYPES_RU:
             self.poly_border_type_combo.addItem(ru)
+        self.poly_border_type_combo.currentIndexChanged.connect(self._on_poly_border_type_changed)
         pb_rl.addWidget(lbl_pb)
         pb_rl.addWidget(self.poly_border_btn)
         pb_rl.addWidget(self.poly_border_type_combo)
@@ -3784,6 +3792,7 @@ class MapTab(QWidget):
         color = QColorDialog.getColor(QColor("#89b4fa"), self, "Цвет заливки")
         if color.isValid():
             self._set_poly_fill_btn(color.name())
+            self.canvas.default_poly_fill = color.name()
             # Применяем ко всем существующим полигонам
             for poly in self.canvas.map_polygons:
                 poly.fill_color = color.name()
@@ -3792,14 +3801,19 @@ class MapTab(QWidget):
     def _on_poly_fill_opacity_changed(self, val: int):
         self.poly_fill_opacity_lbl.setText(f"{val}%")
         opacity = val / 100.0
+        self.canvas.default_poly_fill_opacity = opacity
         for poly in self.canvas.map_polygons:
             poly.fill_opacity = opacity
         self.canvas.update()
+
+    def _on_poly_border_type_changed(self, idx: int):
+        self.canvas.default_poly_border_type = EDGE_TYPES[idx]
 
     def _pick_poly_border_color(self):
         color = QColorDialog.getColor(QColor("#89b4fa"), self, "Цвет рамки")
         if color.isValid():
             self._set_poly_border_btn(color.name())
+            self.canvas.default_poly_border = color.name()
             for poly in self.canvas.map_polygons:
                 poly.border_color = color.name()
             self.canvas.update()
