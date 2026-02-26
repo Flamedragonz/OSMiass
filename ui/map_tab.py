@@ -389,6 +389,7 @@ class MapCanvas(QWidget):
         self.selected_point_ids: set          = set()       # set[str]
         self._hovered_point_id:  Optional[str] = None
         self._pivot_point_id:    Optional[str] = None
+        self._selected_polygon_id: Optional[str] = None
 
         # Иконки (кэш)
         self._icon_cache: Dict[str, Optional[QPixmap]] = {}
@@ -398,6 +399,7 @@ class MapCanvas(QWidget):
         self._drag_was_moved:    bool                             = False
         self._drag_start_screen: Optional[QPointF]               = None
         self._group_drag_origin: Dict[str, Tuple[float, float]]  = {}
+        self._dragging_polygon: Optional[MapPolygon] = None
 
         # Рамка выделения (rubber band)
         self._rubber_band_start:  Optional[QPointF] = None
@@ -666,10 +668,11 @@ class MapCanvas(QWidget):
                 path.lineTo(sp)
             path.closeSubpath()
 
-            painter.setOpacity(poly.fill_opacity)
+            is_sel_poly = (poly.id == self._selected_polygon_id)
+            painter.setOpacity(poly.fill_opacity + (0.1 if is_sel_poly else 0.0))
             painter.fillPath(path, QBrush(QColor(poly.fill_color)))
 
-            pen = QPen(QColor(poly.border_color), poly.border_width)
+            pen = QPen(QColor(poly.border_color), poly.border_width + (1.0 if is_sel_poly else 0.0))
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             if poly.border_type == "dashed":
                 pen.setStyle(Qt.PenStyle.CustomDashLine)
@@ -1222,6 +1225,22 @@ class MapCanvas(QWidget):
 
                 hit = self._find_point_at(mx, my)
 
+                if hit is None and not shift and not ctrl:
+                    poly_hit = self._find_polygon_at(mx, my)
+                    if poly_hit is not None:
+                        self._select_polygon(poly_hit)
+                        self._push_undo()
+                        self._dragging_polygon = poly_hit
+                        self._drag_was_moved = False
+                        self._drag_start_screen = event.position()
+                        self._group_drag_origin = {
+                            pid: (pt.lat, pt.lon)
+                            for pid in poly_hit.point_ids
+                            if (pt := self._get_point_by_id(pid)) is not None
+                        }
+                        self.update()
+                        return
+
                 if hit:
                     alt = bool(mods & Qt.KeyboardModifier.AltModifier)
 
@@ -1332,7 +1351,7 @@ class MapCanvas(QWidget):
             ref_x, ref_y = self._rotate_screen_ref
             angle_ref = math.atan2(ref_y - cy_s, ref_x - cx_s)
             angle_cur = math.atan2(my   - cy_s, mx    - cx_s)
-            delta     = angle_cur - angle_ref
+            delta     = angle_ref - angle_cur
             cos_a   = math.cos(delta)
             sin_a   = math.sin(delta)
             c_lat, c_lon = self._rotate_center_latlon
@@ -1348,7 +1367,7 @@ class MapCanvas(QWidget):
             return
 
         # ── Групповое перетаскивание точек ────────────────────────
-        if self._dragging_point is not None and self._drag_start_screen is not None:
+        if (self._dragging_point is not None or self._dragging_polygon is not None) and self._drag_start_screen is not None:
             dx = mx - self._drag_start_screen.x()
             dy = my - self._drag_start_screen.y()
             if abs(dx) > 2 or abs(dy) > 2 or self._drag_was_moved:
@@ -1413,7 +1432,7 @@ class MapCanvas(QWidget):
 
         if event.button() == Qt.MouseButton.LeftButton:
             # ── Завершаем групповое перетаскивание ────────────────
-            if self._dragging_point is not None:
+            if self._dragging_point is not None or self._dragging_polygon is not None:
                 if self._drag_was_moved:
                     for pt in self._get_selected_points():
                         self.point_moved.emit(pt)
@@ -1421,6 +1440,7 @@ class MapCanvas(QWidget):
                     self._deduplicate_polygons()
                     self._sync_dynamic_points()
                 self._dragging_point    = None
+                self._dragging_polygon  = None
                 self._drag_was_moved    = False
                 self._drag_start_screen = None
                 self._group_drag_origin = {}
@@ -1905,20 +1925,34 @@ class MapCanvas(QWidget):
         if len(pts) < 3:
             return
         self._push_undo()
-        poly = MapPolygon(point_ids=[p.id for p in pts])
+        poly_ids = [p.id for p in pts]
+        for i in range(len(poly_ids)):
+            self._create_edge_raw(poly_ids[i], poly_ids[(i + 1) % len(poly_ids)])
+        poly = MapPolygon(
+            point_ids=poly_ids,
+            fill_color=self.default_poly_fill,
+            fill_opacity=self.default_poly_fill_opacity,
+            border_color=self.default_poly_border,
+            border_width=self.default_poly_border_width,
+            border_type=self.default_poly_border_type,
+        )
         self.map_polygons.append(poly)
+        self._selected_polygon_id = poly.id
+        self._sync_dynamic_points()
         self.update()
 
-    def import_polygon_points(self, lat_lon_points: List[Tuple[float, float]]) -> bool:
+    def import_polygon_points(self, lat_lon_points: List[Tuple[float, float]], auto_point_names: bool = False) -> bool:
         """Импортирует полигон по списку (lat, lon) и создаёт рёбра по порядку."""
         if len(lat_lon_points) < 3:
             return False
         self._push_undo()
         created_pts: List[MapPoint] = []
         for lat, lon in lat_lon_points:
+            idx = len(created_pts) + 1
             pt = MapPoint(
                 lat=lat,
                 lon=lon,
+                label=str(idx) if auto_point_names else "",
                 icon_type=self.default_icon_type,
                 color=self.default_color,
                 size=self.default_size,
@@ -1940,6 +1974,7 @@ class MapCanvas(QWidget):
             border_type=self.default_poly_border_type,
         )
         self.map_polygons.append(poly)
+        self._selected_polygon_id = poly.id
         self.selected_point_ids = set(created_ids)
         self.selection_changed.emit(created_pts)
         self._last_placed_point_id = created_ids[-1]
@@ -1947,6 +1982,47 @@ class MapCanvas(QWidget):
         self._sync_dynamic_points()
         self.update()
         return True
+
+
+    def _get_selected_polygon(self) -> Optional["MapPolygon"]:
+        if not self._selected_polygon_id:
+            return None
+        return next((p for p in self.map_polygons if p.id == self._selected_polygon_id), None)
+
+    def _find_polygon_at(self, sx: float, sy: float) -> Optional["MapPolygon"]:
+        for poly in reversed(self.map_polygons):
+            pts = [self._get_point_by_id(pid) for pid in poly.point_ids]
+            if any(p is None for p in pts) or len(pts) < 3:
+                continue
+            path = QPainterPath()
+            screen = [QPointF(*self._lat_lon_to_screen(p.lat, p.lon)) for p in pts]
+            path.moveTo(screen[0])
+            for sp in screen[1:]:
+                path.lineTo(sp)
+            path.closeSubpath()
+            if path.contains(QPointF(float(sx), float(sy))):
+                return poly
+        return None
+
+    def _select_polygon(self, poly: Optional["MapPolygon"]):
+        self._selected_polygon_id = poly.id if poly else None
+        if poly is None:
+            self.selected_point_ids.clear()
+            self.selection_changed.emit([])
+            return
+        self.selected_point_ids = set(poly.point_ids)
+        self.selection_changed.emit(self._get_selected_points())
+
+    def _renumber_polygon_points_clockwise(self, poly: "MapPolygon", start_pid: str):
+        ids = list(poly.point_ids)
+        if start_pid not in ids:
+            return
+        start_idx = ids.index(start_pid)
+        ordered = ids[start_idx:] + ids[:start_idx]
+        for idx, pid in enumerate(ordered, start=1):
+            pt = self._get_point_by_id(pid)
+            if pt:
+                pt.label = str(idx)
 
     def delete_polygon(self, poly: "MapPolygon"):
         """Удаляет полигон."""
@@ -1983,6 +2059,7 @@ class MapCanvas(QWidget):
         self._hovered_edge_id   = None
         self._pivot_point_id    = None
         self._connect_source_id    = None
+        self._selected_polygon_id  = None
         self._last_placed_point_id = None
         self._chain_start_id       = None
         self.selection_changed.emit([])
@@ -3151,6 +3228,11 @@ class MapTab(QWidget):
         self.poly_import_edit.setFixedHeight(84)
         poly_l.addWidget(self.poly_import_edit)
 
+        self.chk_auto_name_points = QCheckBox("Авто имя точек")
+        self.chk_auto_name_points.setToolTip("Присвоить точкам имена 1..N при создании/импорте")
+        self.chk_auto_name_points.setChecked(True)
+        poly_l.addWidget(self.chk_auto_name_points)
+
         pimp_row = QWidget(); pimp_rl = QHBoxLayout(pimp_row)
         pimp_rl.setContentsMargins(0, 0, 0, 0); pimp_rl.setSpacing(4)
         self.btn_import_poly_text = QPushButton("Импорт текста")
@@ -3712,6 +3794,7 @@ class MapTab(QWidget):
         """Вызывается при добавлении или перемещении точки."""
         self._update_pts_count()
         self._fill_point_props(pt)
+        self._sync_polygon_props()
         self._update_geo_labels()
 
     def _on_point_deleted(self, pt: MapPoint):
@@ -3760,6 +3843,13 @@ class MapTab(QWidget):
 
     def _connect_selected_points(self):
         self.canvas.connect_selected_points()
+        if self.chk_auto_name_points.isChecked():
+            pts = self.canvas._get_selected_points()
+            for idx, pt in enumerate(pts, start=1):
+                pt.label = str(idx)
+        if len(self.canvas._get_selected_points()) >= 3:
+            self.canvas.create_polygon_from_selected()
+        self._sync_polygon_props()
         self._update_geo_labels()
 
     def _disconnect_selected_points(self):
@@ -3788,34 +3878,69 @@ class MapTab(QWidget):
             f"QPushButton:hover {{ border:1px solid #cba6f7; }}"
         )
 
+    def _sync_polygon_props(self):
+        poly = self.canvas._get_selected_polygon()
+        if poly is None:
+            self._set_poly_fill_btn(self.canvas.default_poly_fill)
+            self.poly_fill_slider.blockSignals(True)
+            self.poly_fill_slider.setValue(int(round(self.canvas.default_poly_fill_opacity * 100)))
+            self.poly_fill_slider.blockSignals(False)
+            self.poly_fill_opacity_lbl.setText(f"{int(round(self.canvas.default_poly_fill_opacity * 100))}%")
+            self._set_poly_border_btn(self.canvas.default_poly_border)
+            self.poly_border_type_combo.blockSignals(True)
+            self.poly_border_type_combo.setCurrentIndex(EDGE_TYPES.index(self.canvas.default_poly_border_type))
+            self.poly_border_type_combo.blockSignals(False)
+            return
+        self._set_poly_fill_btn(poly.fill_color)
+        self.poly_fill_slider.blockSignals(True)
+        self.poly_fill_slider.setValue(int(round(poly.fill_opacity * 100)))
+        self.poly_fill_slider.blockSignals(False)
+        self.poly_fill_opacity_lbl.setText(f"{int(round(poly.fill_opacity * 100))}%")
+        self._set_poly_border_btn(poly.border_color)
+        self.poly_border_type_combo.blockSignals(True)
+        self.poly_border_type_combo.setCurrentIndex(EDGE_TYPES.index(poly.border_type))
+        self.poly_border_type_combo.blockSignals(False)
+
     def _pick_poly_fill_color(self):
-        color = QColorDialog.getColor(QColor("#89b4fa"), self, "Цвет заливки")
+        target = self.canvas._get_selected_polygon()
+        base = target.fill_color if target else self.canvas.default_poly_fill
+        color = QColorDialog.getColor(QColor(base), self, "Цвет заливки")
         if color.isValid():
             self._set_poly_fill_btn(color.name())
-            self.canvas.default_poly_fill = color.name()
-            # Применяем ко всем существующим полигонам
-            for poly in self.canvas.map_polygons:
-                poly.fill_color = color.name()
+            if target:
+                target.fill_color = color.name()
+            else:
+                self.canvas.default_poly_fill = color.name()
             self.canvas.update()
 
     def _on_poly_fill_opacity_changed(self, val: int):
         self.poly_fill_opacity_lbl.setText(f"{val}%")
         opacity = val / 100.0
-        self.canvas.default_poly_fill_opacity = opacity
-        for poly in self.canvas.map_polygons:
-            poly.fill_opacity = opacity
+        target = self.canvas._get_selected_polygon()
+        if target:
+            target.fill_opacity = opacity
+        else:
+            self.canvas.default_poly_fill_opacity = opacity
         self.canvas.update()
 
     def _on_poly_border_type_changed(self, idx: int):
-        self.canvas.default_poly_border_type = EDGE_TYPES[idx]
+        target = self.canvas._get_selected_polygon()
+        if target:
+            target.border_type = EDGE_TYPES[idx]
+            self.canvas.update()
+        else:
+            self.canvas.default_poly_border_type = EDGE_TYPES[idx]
 
     def _pick_poly_border_color(self):
-        color = QColorDialog.getColor(QColor("#89b4fa"), self, "Цвет рамки")
+        target = self.canvas._get_selected_polygon()
+        base = target.border_color if target else self.canvas.default_poly_border
+        color = QColorDialog.getColor(QColor(base), self, "Цвет рамки")
         if color.isValid():
             self._set_poly_border_btn(color.name())
-            self.canvas.default_poly_border = color.name()
-            for poly in self.canvas.map_polygons:
-                poly.border_color = color.name()
+            if target:
+                target.border_color = color.name()
+            else:
+                self.canvas.default_poly_border = color.name()
             self.canvas.update()
 
     def _build_labels_filter_menu(self):
@@ -3919,7 +4044,12 @@ class MapTab(QWidget):
         self._refresh_obj_list()
 
     def _create_polygon_from_selected(self):
+        if self.chk_auto_name_points.isChecked():
+            pts = self.canvas._get_selected_points()
+            for idx, pt in enumerate(pts, start=1):
+                pt.label = str(idx)
         self.canvas.create_polygon_from_selected()
+        self._sync_polygon_props()
         self._update_geo_labels()
 
     def _split_selected_polygon(self):
@@ -4038,13 +4168,14 @@ class MapTab(QWidget):
 
     def _apply_point_name(self):
         pt = self._get_selected_point()
-        name = self.pt_name_edit.text()
+        name = self.pt_name_edit.text().strip()
         if pt is not None:
             pt.label = name
+            poly = self.canvas._get_selected_polygon()
+            if poly and name == "1":
+                self.canvas._renumber_polygon_points_clockwise(poly, pt.id)
             self.canvas.update()
         else:
-            # Нет выделенной — устанавливаем в умолчания (нельзя хранить в canvas,
-            # поэтому просто обновим следующую создаваемую точку через дефолт-настройки)
             pass
 
     def _on_icon_changed(self, idx: int):
@@ -4225,7 +4356,7 @@ class MapTab(QWidget):
         if len(points) < 3:
             self._set_polygon_import_status("Ошибка: нужно минимум 3 валидные точки")
             return
-        if self.canvas.import_polygon_points(points):
+        if self.canvas.import_polygon_points(points, auto_point_names=self.chk_auto_name_points.isChecked()):
             self._set_polygon_import_status(f"Импортировано точек: {len(points)}", ok=True)
             self._update_geo_labels()
             self._refresh_obj_list()
@@ -4249,7 +4380,7 @@ class MapTab(QWidget):
         if len(points) < 3:
             self._set_polygon_import_status("Ошибка: в файле найдено меньше 3 точек")
             return
-        if self.canvas.import_polygon_points(points):
+        if self.canvas.import_polygon_points(points, auto_point_names=self.chk_auto_name_points.isChecked()):
             self.poly_import_edit.setPlainText("\n".join(f"{lat}, {lon}" for lat, lon in points))
             self._set_polygon_import_status(
                 f"Импорт из файла: {os.path.basename(file_path)} ({len(points)} т.)",
