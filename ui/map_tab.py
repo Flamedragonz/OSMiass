@@ -10,10 +10,13 @@
 Формат BigPlanet: real_zoom = 17 − stored_z,  x/y — стандартные OSM-тайлы.
 """
 import copy
+import json
 import math
 import os
+import re
 import sqlite3
 import uuid
+import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
@@ -21,7 +24,7 @@ from typing import Optional, List, Tuple, Dict
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QCheckBox, QGroupBox, QRadioButton, QButtonGroup,
-    QApplication, QSizePolicy, QLineEdit,
+    QApplication, QSizePolicy, QLineEdit, QTextEdit,
     QMenu, QColorDialog, QFileDialog, QComboBox, QToolButton,
     QTreeWidget, QTreeWidgetItem, QSplitter, QFrame,
 )
@@ -1899,6 +1902,45 @@ class MapCanvas(QWidget):
         self.map_polygons.append(poly)
         self.update()
 
+    def import_polygon_points(self, lat_lon_points: List[Tuple[float, float]]) -> bool:
+        """Импортирует полигон по списку (lat, lon) и создаёт рёбра по порядку."""
+        if len(lat_lon_points) < 3:
+            return False
+        self._push_undo()
+        created_pts: List[MapPoint] = []
+        for lat, lon in lat_lon_points:
+            pt = MapPoint(
+                lat=lat,
+                lon=lon,
+                icon_type=self.default_icon_type,
+                color=self.default_color,
+                size=self.default_size,
+            )
+            self.map_points.append(pt)
+            created_pts.append(pt)
+            self.point_added.emit(pt)
+
+        created_ids = [pt.id for pt in created_pts]
+        for i in range(len(created_ids)):
+            self._create_edge_raw(created_ids[i], created_ids[(i + 1) % len(created_ids)])
+
+        poly = MapPolygon(
+            point_ids=created_ids,
+            fill_color=self.default_poly_fill,
+            fill_opacity=self.default_poly_fill_opacity,
+            border_color=self.default_poly_border,
+            border_width=self.default_poly_border_width,
+            border_type=self.default_poly_border_type,
+        )
+        self.map_polygons.append(poly)
+        self.selected_point_ids = set(created_ids)
+        self.selection_changed.emit(created_pts)
+        self._last_placed_point_id = created_ids[-1]
+        self._chain_start_id = created_ids[0]
+        self._sync_dynamic_points()
+        self.update()
+        return True
+
     def delete_polygon(self, poly: "MapPolygon"):
         """Удаляет полигон."""
         if poly in self.map_polygons:
@@ -3093,6 +3135,33 @@ class MapTab(QWidget):
         popt_rl.addWidget(self.btn_split_poly)
         poly_l.addWidget(popt_row)
 
+        self.poly_import_edit = QTextEdit()
+        self.poly_import_edit.setPlaceholderText(
+            "Импорт полигона: каждая строка — точка (широта, долгота).\n"
+            "Разделители: запятая, пробел, таб, точка после числа, суффиксы N/E."
+        )
+        self.poly_import_edit.setFixedHeight(84)
+        poly_l.addWidget(self.poly_import_edit)
+
+        pimp_row = QWidget(); pimp_rl = QHBoxLayout(pimp_row)
+        pimp_rl.setContentsMargins(0, 0, 0, 0); pimp_rl.setSpacing(4)
+        self.btn_import_poly_text = QPushButton("Импорт текста")
+        self.btn_import_poly_text.setToolTip("Создать полигон из координат в поле выше")
+        self.btn_import_poly_text.clicked.connect(self._import_polygon_from_text)
+        self.btn_import_poly_file = QPushButton("Импорт файла")
+        self.btn_import_poly_file.clicked.connect(self._import_polygon_from_file)
+        self.btn_make_import_examples = QPushButton("Примеры")
+        self.btn_make_import_examples.setToolTip("Создать примеры файлов импорта (txt/json/xml/xlsx)")
+        self.btn_make_import_examples.clicked.connect(self._create_polygon_import_examples)
+        pimp_rl.addWidget(self.btn_import_poly_text)
+        pimp_rl.addWidget(self.btn_import_poly_file)
+        pimp_rl.addWidget(self.btn_make_import_examples)
+        poly_l.addWidget(pimp_row)
+
+        self.lbl_poly_import_status = QLabel("Импорт: вставьте минимум 3 точки")
+        self.lbl_poly_import_status.setStyleSheet("color:#6c7086; font-size:8pt;")
+        poly_l.addWidget(self.lbl_poly_import_status)
+
         # Динамические точки/разделение при пересечениях
         dyn_row = QWidget(); dyn_rl = QHBoxLayout(dyn_row)
         dyn_rl.setContentsMargins(0, 0, 0, 0); dyn_rl.setSpacing(4)
@@ -4028,6 +4097,200 @@ class MapTab(QWidget):
         else:
             # Без выделенной точки — просто сохраним в дефолт (в виде иконки "circle")
             self.canvas.default_icon_type = "circle"
+
+    # ── Импорт полигона ─────────────────────────────────────────
+
+    @staticmethod
+    def _parse_polygon_coords(raw_text: str) -> List[Tuple[float, float]]:
+        """Парсит строки координат в форматах: запятая/пробел/таб/N-E/точка-разделитель."""
+        points: List[Tuple[float, float]] = []
+        for raw_line in raw_text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            cleaned = line.replace("°", " ")
+            cleaned = re.sub(r"(?<=\d)\s*[NnСс](?=\b)", "", cleaned)
+            cleaned = re.sub(r"(?<=\d)\s*[EeВв](?=\b)", "", cleaned)
+            cleaned = cleaned.replace(";", " ").replace("\t", " ")
+
+            nums = re.findall(r"[-+]?\d+(?:\.\d+)?", cleaned)
+            if len(nums) < 2:
+                continue
+
+            lat = float(nums[0])
+            lon = float(nums[1])
+            if abs(lat) > 90 and abs(lon) <= 90:
+                lat, lon = lon, lat
+            points.append((lat, lon))
+        return points
+
+    @staticmethod
+    def _extract_coords_from_json_node(node) -> List[Tuple[float, float]]:
+        result: List[Tuple[float, float]] = []
+        if isinstance(node, list):
+            if len(node) >= 2 and all(isinstance(node[i], (int, float)) for i in (0, 1)):
+                lat, lon = float(node[0]), float(node[1])
+                if abs(lat) > 90 and abs(lon) <= 90:
+                    lat, lon = lon, lat
+                result.append((lat, lon))
+            else:
+                for item in node:
+                    result.extend(MapTab._extract_coords_from_json_node(item))
+        elif isinstance(node, dict):
+            if "lat" in node and ("lon" in node or "lng" in node):
+                lon_key = "lon" if "lon" in node else "lng"
+                result.append((float(node["lat"]), float(node[lon_key])))
+            elif "latitude" in node and ("longitude" in node or "lon" in node):
+                lon_key = "longitude" if "longitude" in node else "lon"
+                result.append((float(node["latitude"]), float(node[lon_key])))
+            else:
+                for value in node.values():
+                    result.extend(MapTab._extract_coords_from_json_node(value))
+        return result
+
+    def _load_polygon_points_from_file(self, file_path: str) -> List[Tuple[float, float]]:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in {".txt", ".csv"}:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return self._parse_polygon_coords(f.read())
+
+        if ext == ".json":
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return self._extract_coords_from_json_node(data)
+
+        if ext == ".xml":
+            root = ET.parse(file_path).getroot()
+            points: List[Tuple[float, float]] = []
+            for node in root.iter():
+                lat = node.attrib.get("lat") or node.attrib.get("latitude")
+                lon = (
+                    node.attrib.get("lon")
+                    or node.attrib.get("lng")
+                    or node.attrib.get("longitude")
+                )
+                if lat is not None and lon is not None:
+                    points.append((float(lat), float(lon)))
+            if points:
+                return points
+            return self._parse_polygon_coords("\n".join((n.text or "") for n in root.iter()))
+
+        if ext in {".xlsx", ".xlsm", ".xls"}:
+            import openpyxl
+
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            ws = wb.active
+            points: List[Tuple[float, float]] = []
+            for row in ws.iter_rows(values_only=True):
+                vals = [v for v in row if v is not None and str(v).strip() != ""]
+                if len(vals) < 2:
+                    continue
+                try:
+                    lat = float(str(vals[0]).replace(",", "."))
+                    lon = float(str(vals[1]).replace(",", "."))
+                except Exception:
+                    continue
+                if abs(lat) > 90 and abs(lon) <= 90:
+                    lat, lon = lon, lat
+                points.append((lat, lon))
+            wb.close()
+            return points
+
+        return []
+
+    def _set_polygon_import_status(self, text: str, ok: bool = False):
+        if not hasattr(self, "lbl_poly_import_status"):
+            return
+        color = "#a6e3a1" if ok else "#f38ba8"
+        self.lbl_poly_import_status.setStyleSheet(f"color:{color}; font-size:8pt;")
+        self.lbl_poly_import_status.setText(text)
+
+    def _import_polygon_from_text(self):
+        text = self.poly_import_edit.toPlainText()
+        points = self._parse_polygon_coords(text)
+        if len(points) < 3:
+            self._set_polygon_import_status("Ошибка: нужно минимум 3 валидные точки")
+            return
+        if self.canvas.import_polygon_points(points):
+            self._set_polygon_import_status(f"Импортировано точек: {len(points)}", ok=True)
+            self._update_geo_labels()
+            self._refresh_obj_list()
+            self._update_pts_count()
+
+    def _import_polygon_from_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Импорт полигона",
+            "",
+            "Поддерживаемые файлы (*.txt *.csv *.json *.xml *.xlsx *.xlsm *.xls);;"
+            "Текст (*.txt *.csv);;JSON (*.json);;XML (*.xml);;Excel (*.xlsx *.xlsm *.xls)",
+        )
+        if not file_path:
+            return
+        try:
+            points = self._load_polygon_points_from_file(file_path)
+        except Exception as e:
+            self._set_polygon_import_status(f"Ошибка файла: {e}")
+            return
+        if len(points) < 3:
+            self._set_polygon_import_status("Ошибка: в файле найдено меньше 3 точек")
+            return
+        if self.canvas.import_polygon_points(points):
+            self.poly_import_edit.setPlainText("\n".join(f"{lat}, {lon}" for lat, lon in points))
+            self._set_polygon_import_status(
+                f"Импорт из файла: {os.path.basename(file_path)} ({len(points)} т.)",
+                ok=True,
+            )
+            self._update_geo_labels()
+            self._refresh_obj_list()
+            self._update_pts_count()
+
+    def _create_polygon_import_examples(self):
+        folder = QFileDialog.getExistingDirectory(self, "Папка для примеров импорта")
+        if not folder:
+            return
+
+        sample = [
+            (55.36798, 60.21226),
+            (55.36920, 60.21259),
+            (55.37030, 60.21263),
+            (55.37038, 60.21432),
+            (55.36922, 60.21394),
+            (55.36785, 60.21415),
+        ]
+        txt_data = "\n".join(f"{lat}, {lon}" for lat, lon in sample)
+        with open(os.path.join(folder, "polygon_import_sample.txt"), "w", encoding="utf-8") as f:
+            f.write(txt_data)
+
+        with open(os.path.join(folder, "polygon_import_sample.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {"polygon": [{"lat": lat, "lon": lon} for lat, lon in sample]},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        root = ET.Element("polygon")
+        for lat, lon in sample:
+            ET.SubElement(root, "point", lat=f"{lat}", lon=f"{lon}")
+        ET.ElementTree(root).write(
+            os.path.join(folder, "polygon_import_sample.xml"),
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Polygon"
+        ws.append(["lat", "lon"])
+        for lat, lon in sample:
+            ws.append([lat, lon])
+        wb.save(os.path.join(folder, "polygon_import_sample.xlsx"))
+        wb.close()
+
+        self._set_polygon_import_status(f"Примеры сохранены в: {folder}", ok=True)
 
     # ── Публичный API ────────────────────────────────────────────
 
