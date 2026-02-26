@@ -2759,7 +2759,40 @@ class MapTab(QWidget):
         _left_l.setSpacing(0)
         self._left_l = _left_l   # сохраняем для дальнейших addWidget
 
-        # ── Карта ────────────────────────────────────────────────
+        # ── Верхнее меню инструментов ────────────────────────────
+        menu_w = QWidget()
+        menu_w.setStyleSheet("QWidget { background-color:#181825; border-bottom:1px solid #313244; }")
+        menu_l = QHBoxLayout(menu_w)
+        menu_l.setContentsMargins(8, 6, 8, 6)
+        menu_l.setSpacing(6)
+
+        self.menu_btn_group = QButtonGroup(self)
+        self.menu_btn_group.setExclusive(True)
+        self.menu_buttons = {}
+        for key, title in (
+            ("coords", "Координаты"),
+            ("layers", "Слои"),
+            ("nav", "Навигация"),
+            ("points", "Точки"),
+            ("edges", "Рёбра"),
+            ("polygons", "Полигоны"),
+        ):
+            btn = QPushButton(title)
+            btn.setCheckable(True)
+            btn.setMinimumHeight(30)
+            btn.clicked.connect(lambda _checked, section=key: self._show_side_section(section))
+            self.menu_btn_group.addButton(btn)
+            self.menu_buttons[key] = btn
+            menu_l.addWidget(btn)
+        menu_l.addStretch()
+        self._left_l.addWidget(menu_w)
+
+        # ── Карта + левая боковая панель ─────────────────────────
+        map_row = QWidget()
+        map_row_l = QHBoxLayout(map_row)
+        map_row_l.setContentsMargins(0, 0, 0, 0)
+        map_row_l.setSpacing(0)
+
         self.canvas = MapCanvas(self)
         self.canvas.coord_clicked.connect(self._on_click)
         self.canvas.coord_hovered.connect(self._on_hover)
@@ -2777,19 +2810,21 @@ class MapTab(QWidget):
         self.canvas.point_moved.connect(lambda _: self._refresh_obj_list())
         self.canvas.edge_added.connect(lambda _: self._refresh_obj_list())
         self.canvas.edge_deleted.connect(lambda _: self._refresh_obj_list())
-        self._left_l.addWidget(self.canvas, 1)
-
-        # ── Нижняя панель управления ─────────────────────────────
+        # ── Левая панель управления ──────────────────────────────
         panel = QWidget()
         panel.setStyleSheet(
             "QWidget { background-color: #181825; }"
-            "QWidget#map_panel { border-top: 1px solid #313244; }"
+            "QWidget#map_panel { border-right: 1px solid #313244; }"
         )
         panel.setObjectName("map_panel")
+        panel.setFixedWidth(340)
 
-        pl = QHBoxLayout(panel)
-        pl.setContentsMargins(10, 6, 10, 6)
-        pl.setSpacing(10)
+        map_row_l.addWidget(panel)
+        map_row_l.addWidget(self.canvas, 1)
+
+        self._side_layout = QVBoxLayout(panel)
+        self._side_layout.setContentsMargins(8, 6, 8, 6)
+        self._side_layout.setSpacing(8)
 
         _gs = (
             "QGroupBox { font-size:9pt; color:#a6adc8; border:1px solid #45475a; "
@@ -2797,10 +2832,10 @@ class MapTab(QWidget):
             "QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; }"
         )
 
-        # ─── Поиск координат ─────────────────────────────────────
-        search_g = QGroupBox("Поиск координат")
-        search_g.setStyleSheet(_gs)
-        sg_l = QVBoxLayout(search_g)
+        # ─── Поиск + координаты ──────────────────────────────────
+        self.coords_g = QGroupBox("Поиск координат и координаты")
+        self.coords_g.setStyleSheet(_gs)
+        sg_l = QVBoxLayout(self.coords_g)
         sg_l.setContentsMargins(6, 10, 6, 6)
         sg_l.setSpacing(4)
 
@@ -2818,7 +2853,7 @@ class MapTab(QWidget):
         self.chk_search_add_point.setChecked(False)
         sg_l.addWidget(self.chk_search_add_point)
 
-        pl.addWidget(search_g)
+        self._side_layout.addWidget(self.coords_g)
 
         # ─── Слои ────────────────────────────────────────────────
         self.layers_g  = QGroupBox("Слои")
@@ -2826,12 +2861,12 @@ class MapTab(QWidget):
         self.layers_vl = QVBoxLayout(self.layers_g)
         self.layers_vl.setContentsMargins(6, 10, 6, 4)
         self.layers_vl.setSpacing(3)
-        pl.addWidget(self.layers_g, 1)   # растягиваем
+        self._side_layout.addWidget(self.layers_g)
 
         # ─── Навигация ────────────────────────────────────────────
-        nav_g = QGroupBox("Навигация")
-        nav_g.setStyleSheet(_gs)
-        nav_l = QVBoxLayout(nav_g)
+        self.nav_g = QGroupBox("Навигация")
+        self.nav_g.setStyleSheet(_gs)
+        nav_l = QVBoxLayout(self.nav_g)
         nav_l.setContentsMargins(6, 10, 6, 6)
         nav_l.setSpacing(4)
 
@@ -2892,7 +2927,7 @@ class MapTab(QWidget):
         nav_l.addWidget(self.btn_center)
         nav_l.addStretch()
 
-        pl.addWidget(nav_g)
+        self._side_layout.addWidget(self.nav_g)
 
         # ─── Вставка координат в таблицу ─────────────────────────
         self.insert_g = QGroupBox("Вставка координат в таблицу")
@@ -2935,7 +2970,7 @@ class MapTab(QWidget):
         insert_l.addWidget(btns_w)
         insert_l.addStretch()
 
-        pl.addWidget(self.insert_g)
+        self._side_layout.addWidget(self.insert_g)
 
         # ─── Группа измерения (только в режиме обзора) ───────────
         self.measure_g = QGroupBox("Измерение расстояний")
@@ -2960,7 +2995,7 @@ class MapTab(QWidget):
         meas_l.addStretch()
 
         self.measure_g.setVisible(False)  # скрыта по умолчанию
-        pl.addWidget(self.measure_g)
+        self._side_layout.addWidget(self.measure_g)
 
         # ─── Панель свойств точек ─────────────────────────────────
         self.points_g = QGroupBox("Точки")
@@ -3068,7 +3103,7 @@ class MapTab(QWidget):
         pts_l.addWidget(lbl_pts_hint)
 
         self.points_g.setVisible(False)   # скрыта по умолчанию
-        pl.addWidget(self.points_g)
+        self._side_layout.addWidget(self.points_g)
 
         # ─── Панель рёбер ─────────────────────────────────────────
         self.edges_g = QGroupBox("Рёбра")
@@ -3142,7 +3177,7 @@ class MapTab(QWidget):
         edg_l.addWidget(self.btn_connect_mode)
 
         self.edges_g.setVisible(False)
-        pl.addWidget(self.edges_g)
+        self._side_layout.addWidget(self.edges_g)
 
         # ─── Панель полигонов ─────────────────────────────────────
         self.polygon_g = QGroupBox("Полигоны")
@@ -3269,14 +3304,15 @@ class MapTab(QWidget):
         poly_l.addWidget(dyn_row)
 
         self.polygon_g.setVisible(False)
-        pl.addWidget(self.polygon_g)
+        self._side_layout.addWidget(self.polygon_g)
 
         # ─── Геометрия (суммарная статистика) ────────────────────
         self.geo_g = QGroupBox("Геометрия")
+        self.geo_g.setMaximumHeight(110)
         self.geo_g.setStyleSheet(_gs)
         geo_l = QVBoxLayout(self.geo_g)
-        geo_l.setContentsMargins(6, 10, 6, 6)
-        geo_l.setSpacing(4)
+        geo_l.setContentsMargins(4, 8, 4, 4)
+        geo_l.setSpacing(2)
 
         self.lbl_total_length = QLabel("Рёбра: 0 м")
         self.lbl_total_length.setStyleSheet(
@@ -3306,13 +3342,11 @@ class MapTab(QWidget):
         geo_l.addWidget(unit_row)
 
         self.geo_g.setVisible(False)
-        pl.addWidget(self.geo_g)
+        self._side_layout.addWidget(self.geo_g)
 
         # ─── Координаты курсора ───────────────────────────────────
-        coord_g = QGroupBox("Координаты")
-        coord_g.setStyleSheet(_gs)
-        coord_l = QVBoxLayout(coord_g)
-        coord_l.setContentsMargins(6, 10, 6, 6)
+        coord_l = QVBoxLayout()
+        coord_l.setContentsMargins(0, 2, 0, 0)
         coord_l.setSpacing(4)
 
         self.lbl_cursor = QLabel("—")
@@ -3331,10 +3365,14 @@ class MapTab(QWidget):
         self.btn_copy.clicked.connect(self._copy_last_coords)
         coord_l.addWidget(self.btn_copy)
         coord_l.addStretch()
+        self.coords_g.layout().addLayout(coord_l)
 
-        pl.addWidget(coord_g)
+        self._side_layout.addStretch(1)
+        self._left_l.addWidget(map_row, 1)
 
-        self._left_l.addWidget(panel)
+        self._active_side_section = "coords"
+        self.menu_buttons["coords"].setChecked(True)
+        self._show_side_section("coords")
 
         # Правая панель: список объектов
         self._main_splitter.addWidget(_left_w)
@@ -3616,6 +3654,26 @@ class MapTab(QWidget):
 
         self.search_edit.setStyleSheet("border: 1px solid #f38ba8;")
 
+    def _show_side_section(self, section: str):
+        self._active_side_section = section
+        is_pts_mode = self.radio_pts.isChecked()
+        widgets = {
+            "coords": self.coords_g,
+            "layers": self.layers_g,
+            "nav": self.nav_g,
+            "points": self.points_g,
+            "edges": self.edges_g,
+            "polygons": self.polygon_g,
+        }
+        for key, widget in widgets.items():
+            if key in {"points", "edges", "polygons"}:
+                widget.setVisible(is_pts_mode and key == section)
+            else:
+                widget.setVisible(key == section)
+
+        # компактный блок «Геометрия» всегда внизу слева в режиме «Точки»
+        self.geo_g.setVisible(is_pts_mode)
+
     # ── Переключение режима ───────────────────────────────────────
 
     def _on_mode_changed(self, checked: bool):
@@ -3627,10 +3685,15 @@ class MapTab(QWidget):
 
         self.insert_g.setVisible(not is_view and not is_pts)
         self.measure_g.setVisible(is_view)
-        self.points_g.setVisible(is_pts)
-        self.edges_g.setVisible(is_pts)
-        self.polygon_g.setVisible(is_pts)
-        self.geo_g.setVisible(is_pts)
+
+        if is_pts and self._active_side_section not in {"points", "edges", "polygons"}:
+            self.menu_buttons["points"].setChecked(True)
+            self._show_side_section("points")
+        elif not is_pts and self._active_side_section in {"points", "edges", "polygons"}:
+            self.menu_buttons["coords"].setChecked(True)
+            self._show_side_section("coords")
+        else:
+            self._show_side_section(self._active_side_section)
 
         if not is_view:
             # Очищаем временные точки при выходе из режима обзора
