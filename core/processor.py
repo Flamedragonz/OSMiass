@@ -57,6 +57,11 @@ def build_lines(template: List[str], row: Dict) -> List[str]:
         key = k.strip()
         if key == "дата":
             val = val.replace(".", "-")
+        elif key in ("широта", "долгота") and val:
+            try:
+                val = f"{float(val):.5f}"
+            except ValueError:
+                pass
         cleaned[key] = val
 
     result = []
